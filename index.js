@@ -89,3 +89,6 @@ client.initialize().catch(err => {
     console.error('Erreur init:', err);
     process.exit(1);
 });
+# WhatsApp Bot - Version Final - Troll - Transcript données - NatSNB68
+
+#
