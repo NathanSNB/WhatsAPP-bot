@@ -1,87 +1,205 @@
-const { Client } = require('whatsapp-web.js');
-const fs = require('fs');
+const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 
-const client = new Client();
+// Utilisation du dossier temporaire du système pour éviter les problèmes de permissions
+const tempDir = os.tmpdir();
+const USER_DATA_DIR = path.join(tempDir, `whatsapp-bot-${Math.random().toString(36).slice(2)}`);
 
-let spamInterval; // Variable pour le spam
+// Configuration des chemins dans le dossier du projet
+const PROJECT_DIR = process.cwd();
+const CSV_FILE = path.join(PROJECT_DIR, 'messages.csv');
+const CSV_HEADER = 'Contenu,Qui,Chez Qui/Ou,Heure\n';
 
-// Créer un stream pour écrire dans le fichier CSV
-const logStream = fs.createWriteStream('messages.csv', { flags: 'a' });
-logStream.write('Contenu, Qui, Chez Qui/Ou, Heure\n'); // Entête du fichier CSV
+// Configuration sécurisée pour Puppeteer
+const PUPPETEER_CONFIG = {
+    headless: true,
+    executablePath: '/usr/bin/chromium-browser',
+    args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--disable-gpu',
+        '--disable-extensions',
+        `--user-data-dir=${USER_DATA_DIR}`,
+        '--disable-software-rasterizer',
+        '--disable-web-security',
+        '--disable-background-timer-throttling',
+        '--disable-renderer-backgrounding',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-background-throttling',
+    ],
+};
 
-// Code QR pour la connexion à WhatsApp
+// Fonction pour créer un dossier avec les bonnes permissions
+function createSecureDirectory(dirPath) {
+    try {
+        if (!fs.existsSync(dirPath)) {
+            fs.mkdirSync(dirPath, { recursive: true, mode: 0o700 });
+        }
+        // S'assurer que seul l'utilisateur actuel a accès au dossier
+        fs.chmodSync(dirPath, 0o700);
+        return true;
+    } catch (error) {
+        console.error(`Erreur lors de la création/modification de ${dirPath}:`, error);
+        return false;
+    }
+}
+
+// Fonction pour nettoyer les anciens dossiers temporaires
+function cleanupTempDirectories() {
+    try {
+        if (fs.existsSync(USER_DATA_DIR)) {
+            fs.rmSync(USER_DATA_DIR, { recursive: true, force: true });
+            console.log('Ancien dossier temporaire nettoyé.');
+        }
+    } catch (error) {
+        console.error('Erreur lors du nettoyage des dossiers temporaires:', error);
+    }
+}
+
+// Préparation de l'environnement
+if (!fs.existsSync(USER_DATA_DIR)) {
+    cleanupTempDirectories();  // Nettoyage uniquement si le dossier n'existe pas
+}
+createSecureDirectory(USER_DATA_DIR);
+
+// Vérification/création du fichier CSV
+if (!fs.existsSync(CSV_FILE)) {
+    fs.writeFileSync(CSV_FILE, CSV_HEADER, { mode: 0o600 });
+}
+
+// État global pour le spam
+let spamInterval = null;
+
+// Initialisation du client WhatsApp avec la nouvelle configuration
+const client = new Client({
+    authStrategy: new LocalAuth({
+        clientId: 'client-one',
+        dataPath: USER_DATA_DIR
+    }),
+    puppeteer: PUPPETEER_CONFIG
+});
+
+// Fonction pour les logs avec horodatage
+function log(type, message) {
+    const timestamp = new Date().toISOString();
+    console.log(`[${timestamp}] [${type}] ${message}`);
+}
+
+// Fonction pour sauvegarder un message dans le CSV
+function saveToCSV(content, sender, receiver, timestamp) {
+    const escapedContent = content.replace(/"/g, '""');
+    const formattedDate = new Date(timestamp).toLocaleString('fr-FR');
+    const csvLine = `"${escapedContent}","${sender}","${receiver}","${formattedDate}"\n`;
+
+    fs.appendFileSync(CSV_FILE, csvLine, 'utf-8');
+}
+
+// Gestion du spam avec meilleure gestion des erreurs
+async function startSpam(chat, message) {
+    if (spamInterval) {
+        log('ERROR', 'Un spam est déjà en cours');
+        return;
+    }
+
+    log('COMMAND', `Démarrage du spam: ${message}`);
+    spamInterval = setInterval(async () => {
+        try {
+            await chat.sendMessage(message);
+        } catch (error) {
+            log('ERROR', `Erreur lors de l'envoi du spam: ${error.message}`);
+            stopSpam();
+        }
+    }, 1000);
+}
+
+function stopSpam() {
+    if (!spamInterval) {
+        log('ERROR', 'Aucun spam en cours');
+        return;
+    }
+
+    clearInterval(spamInterval);
+    spamInterval = null;
+    log('COMMAND', 'Spam arrêté');
+}
+
+// Gestion propre de la fermeture
+process.on('SIGINT', async () => {
+    log('AUTH', 'Fermeture du programme...');
+    if (spamInterval) {
+        stopSpam();
+    }
+    try {
+        await client.destroy();
+        log('AUTH', 'Client déconnecté proprement');
+        process.exit(0);
+    } catch (error) {
+        log('ERROR', `Erreur lors de la fermeture: ${error.message}`);
+        process.exit(1);
+    }
+});
+
+// Événements du client WhatsApp
 client.on('qr', (qr) => {
+    log('AUTH', 'QR Code généré');
     qrcode.generate(qr, { small: true });
-    console.log('QR Code reçu, scannez-le avec votre application WhatsApp.');
 });
 
-// Quand le client est prêt
 client.on('ready', () => {
-    console.log('Client WhatsApp prêt et connecté avec succès.');
+    log('AUTH', 'Client WhatsApp connecté');
 });
 
-// Quand un message est envoyé
-client.on('message_create', (msg) => {
+client.on('message_create', async (message) => {
     try {
-        // Loguer le message dans la console
-        console.log(`NOUVEAU MESSAGE :
-        Contenu: ${msg.body}
-        Par qui ? : ${msg.from}
-        Chez qui/ou ? : ${msg.to}
-        Heure: ${new Date(msg.timestamp * 1000).toLocaleString()}`);
+        if (!message.fromMe) {
+            log('INFO', 'Message reçu de quelqu\'un d\'autre');
+            const chat = await message.getChat();
+            const contact = await message.getContact();
+            log('INFO', `Message reçu de ${contact.pushname || contact.number}`);
+        }
 
-        // Loguer dans le fichier CSV
-        logStream.write(`"${msg.body.replace(/"/g, '""')}", "${msg.from}", "${msg.to}", "${new Date(msg.timestamp * 1000).toLocaleString()}"\n`);
+        const chat = await message.getChat();
+        const contact = await message.getContact();
+        log('INFO', `Message ${message.fromMe ? 'envoyé' : 'reçu'}: ${message.body}`);
+        saveToCSV(
+            message.body,
+            message.fromMe ? 'BOT' : contact.pushname || contact.number,
+            chat.name || chat.id._serialized,
+            message.timestamp
+        );
+
+        if (message.body.startsWith('!')) {
+            const [command, ...args] = message.body.split(' ');
+            switch (command.toLowerCase()) {
+                case '!spam':
+                    if (args.length === 0) {
+                        log('ERROR', 'Message de spam non fourni');
+                        return;
+                    }
+                    await startSpam(chat, args.join(' '));
+                    break;
+                case '!stop':
+                    stopSpam();
+                    break;
+                default:
+                    log('ERROR', `Commande inconnue: ${command}`);
+            }
+        }
     } catch (error) {
-        console.error('Erreur lors du traitement du message:', error);
+        log('ERROR', `Erreur lors du traitement du message: ${error.message}`);
     }
 });
 
-// Quand un message est reçu
-client.on('message', async (msg) => {
-    try {
-        // Vérifie si le message commence par la commande !spam
-        if (msg.body.startsWith('!spam')) {
-            const spamMessage = msg.body.substring(6).trim(); // Extrait le message après !spam
-            if (spamMessage) {
-                // Commence le spam du message dans le groupe
-                console.log(`Démarrage du spam: "${spamMessage}" dans le groupe ${msg.to}`);
-                
-                spamInterval = setInterval(async () => {
-                    await msg.reply(spamMessage);
-                    console.log(`Message spamé: "${spamMessage}"`);
-                }, 1000); // Envoie le message toutes les 1 seconde (1000ms)
-            } else {
-                await msg.reply('Veuillez spécifier un message après !spam.');
-            }
-        }
-
-        // Vérifie si le message commence par la commande !stop
-        if (msg.body === '!stop') {
-            if (spamInterval) {
-                clearInterval(spamInterval); // Arrête le spam
-                console.log('Le spam a été arrêté.');
-                await msg.reply('Le spam a été arrêté.');
-            } else {
-                await msg.reply('Aucun spam en cours.');
-            }
-        }
-
-    } catch (error) {
-        console.error('Erreur lors du traitement du message:', error);
-    }
-});
-
-// Quand le client est authentifié
-client.on('authenticated', () => {
-    console.log('Client authentifié avec succès.');
-});
-
-// Quand le client se déconnecte
 client.on('disconnected', (reason) => {
-    console.log(`Client déconnecté: ${reason}`);
+    log('AUTH', `Client déconnecté: ${reason}`);
 });
 
-// Démarrer le client WhatsApp
-client.initialize();
+// Initialisation du client avec gestion des erreurs
+client.initialize().catch(error => {
+    log('ERROR', `Erreur d'initialisation: ${error.message}`);
+});
