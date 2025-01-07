@@ -1,87 +1,91 @@
-const { Client } = require('whatsapp-web.js');
+const { Client, LocalAuth } = require('whatsapp-web.js');
 const fs = require('fs');
-const qrcode = require('qrcode-terminal');
+const path = require('path');
 
-const client = new Client();
+const CSV_FILE = path.join(process.cwd(), 'all_messages.csv');
+const CSV_HEADER = 'Chat Name,Sender,Message,Timestamp\n';
 
-let spamInterval; // Variable pour le spam
+if (!fs.existsSync(CSV_FILE)) {
+    fs.writeFileSync(CSV_FILE, CSV_HEADER, { encoding: 'utf-8', flag: 'w' });
+}
 
-// Créer un stream pour écrire dans le fichier CSV
-const logStream = fs.createWriteStream('messages.csv', { flags: 'a' });
-logStream.write('Contenu, Qui, Chez Qui/Ou, Heure\n'); // Entête du fichier CSV
+const client = new Client({
+    authStrategy: new LocalAuth({ clientId: 'client-one' }),
+    puppeteer: {
+        headless: false,
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-accelerated-2d-canvas',
+            '--disable-gpu',
+            '--window-size=1920x1080'
+        ],
+        defaultViewport: null,
+        executablePath: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+        timeout: 0
+    }
+});
 
-// Code QR pour la connexion à WhatsApp
+function saveToCSV(chatName, sender, message, timestamp) {
+    const escapedMessage = message.replace(/"/g, '""');
+    const csvLine = `"${chatName}","${sender}","${escapedMessage}","${new Date(timestamp).toLocaleString('fr-FR')}"\n`;
+    fs.appendFileSync(CSV_FILE, csvLine, 'utf-8');
+}
+
+async function fetchAllMessages(chat) {
+    try {
+        const messages = await chat.fetchMessages({ limit: 10000 });
+        return messages;
+    } catch (error) {
+        console.error(`Erreur: ${chat.name}:`, error);
+        return [];
+    }
+}
+
+async function transcribeAllMessages() {
+    try {
+        console.log('Récupération des chats...');
+        const chats = await client.getChats();
+        
+        for (const chat of chats) {
+            console.log(`Transcription: ${chat.name || chat.id._serialized}...`);
+            const messages = await fetchAllMessages(chat);
+            
+            messages.forEach(message => {
+                if (message.body) {
+                    const sender = message.fromMe ? 'Vous' : message.author || message.from;
+                    saveToCSV(chat.name || chat.id._serialized, sender, message.body, message.timestamp * 1000);
+                }
+            });
+            
+            console.log(`Terminé: ${chat.name || chat.id._serialized}`);
+        }
+    } catch (error) {
+        console.error('Erreur:', error);
+    }
+}
+
+client.on('ready', async () => {
+    console.log('Début de la transcription...');
+    await transcribeAllMessages();
+    console.log('Transcription terminée:', CSV_FILE);
+    process.exit(0);
+});
+
 client.on('qr', (qr) => {
-    qrcode.generate(qr, { small: true });
-    console.log('QR Code reçu, scannez-le avec votre application WhatsApp.');
+    console.log('Scannez le QR code:');
+    require('qrcode-terminal').generate(qr, { small: true });
 });
 
-// Quand le client est prêt
-client.on('ready', () => {
-    console.log('Client WhatsApp prêt et connecté avec succès.');
+client.on('auth_failure', msg => console.error('Échec auth:', msg));
+
+client.on('disconnected', reason => {
+    console.log('Déconnecté:', reason);
+    process.exit(1);
 });
 
-// Quand un message est envoyé
-client.on('message_create', (msg) => {
-    try {
-        // Loguer le message dans la console
-        console.log(`NOUVEAU MESSAGE :
-        Contenu: ${msg.body}
-        Par qui ? : ${msg.from}
-        Chez qui/ou ? : ${msg.to}
-        Heure: ${new Date(msg.timestamp * 1000).toLocaleString()}`);
-
-        // Loguer dans le fichier CSV
-        logStream.write(`"${msg.body.replace(/"/g, '""')}", "${msg.from}", "${msg.to}", "${new Date(msg.timestamp * 1000).toLocaleString()}"\n`);
-    } catch (error) {
-        console.error('Erreur lors du traitement du message:', error);
-    }
+client.initialize().catch(err => {
+    console.error('Erreur init:', err);
+    process.exit(1);
 });
-
-// Quand un message est reçu
-client.on('message', async (msg) => {
-    try {
-        // Vérifie si le message commence par la commande !spam
-        if (msg.body.startsWith('!spam')) {
-            const spamMessage = msg.body.substring(6).trim(); // Extrait le message après !spam
-            if (spamMessage) {
-                // Commence le spam du message dans le groupe
-                console.log(`Démarrage du spam: "${spamMessage}" dans le groupe ${msg.to}`);
-                
-                spamInterval = setInterval(async () => {
-                    await msg.reply(spamMessage);
-                    console.log(`Message spamé: "${spamMessage}"`);
-                }, 1000); // Envoie le message toutes les 1 seconde (1000ms)
-            } else {
-                await msg.reply('Veuillez spécifier un message après !spam.');
-            }
-        }
-
-        // Vérifie si le message commence par la commande !stop
-        if (msg.body === '!stop') {
-            if (spamInterval) {
-                clearInterval(spamInterval); // Arrête le spam
-                console.log('Le spam a été arrêté.');
-                await msg.reply('Le spam a été arrêté.');
-            } else {
-                await msg.reply('Aucun spam en cours.');
-            }
-        }
-
-    } catch (error) {
-        console.error('Erreur lors du traitement du message:', error);
-    }
-});
-
-// Quand le client est authentifié
-client.on('authenticated', () => {
-    console.log('Client authentifié avec succès.');
-});
-
-// Quand le client se déconnecte
-client.on('disconnected', (reason) => {
-    console.log(`Client déconnecté: ${reason}`);
-});
-
-// Démarrer le client WhatsApp
-client.initialize();
